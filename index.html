@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>中崎町 立体避難マップ</title>
+
+  <!-- MapLibre GL JS -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <!-- deck.gl（MapLibre は 3D Tiles を直接読めないため、Tile3DLayer で描画する） -->
+  <script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #map { position: absolute; inset: 0; }
+    #info {
+      position: absolute; top: 10px; left: 10px; z-index: 1; max-width: 260px;
+      background: rgba(255, 255, 255, 0.92); padding: 8px 12px; border-radius: 6px;
+      font: 13px/1.5 sans-serif; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    }
+    #info ul { list-style: none; margin: 6px 0 0; padding: 0; }
+    #info li { display: flex; align-items: center; gap: 6px; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0, 0, 0, 0.25); }
+    .dot { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, 0.25); }
+    .maplibregl-marker { cursor: pointer; }
+    .spot-popup { font: 13px/1.6 sans-serif; }
+    .spot-popup h3 { margin: 0 0 4px; font-size: 15px; border-left: 4px solid; padding-left: 6px; }
+    .spot-popup .tag { display: inline-block; margin-bottom: 4px; padding: 0 6px; border-radius: 3px; font-size: 11px; color: #fff; }
+    .spot-popup p { margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">
+    <b>中崎町 水害時の立体避難マップ</b><br />
+    <span id="status">3D Tiles を読み込み中…</span>
+    <ul>
+      <li><span class="swatch" style="background:#87CEFA"></span>高さ9m（約3階建て）以上の建物（垂直避難の候補）</li>
+      <li><span class="swatch" style="background:#A9A9A9"></span>高さ9m未満の建物</li>
+      <li><span class="dot" style="background:#1E6FFF"></span>避難所・津波避難ビル</li>
+      <li><span class="dot" style="background:#90EE90"></span>周辺スポット</li>
+    </ul>
+  </div>
+
+  <script>
+    // PLATEAU 大阪市北区 建築物モデル LOD2（テクスチャなし, 2025年度）
+    // 出典: PLATEAU データカタログ API (https://api.plateau.reearth.io/datacatalog/plateau-datasets)
+    const PLATEAU_TILESET_URL =
+      'https://assets.cms.plateau.reearth.io/assets/40/e1dacb-f310-4e2b-84f0-b68ce6d43899/' +
+      '27100_osaka-shi_city_2025_citygml_1_op_bldg_3dtiles_27127_kita-ku_lod2_no_texture/tileset.json';
+
+    // PLATEAU の高さは楕円体高のため、ジオイド高（大阪付近で約37m）だけ下げて地面に合わせる
+    const GEOID_HEIGHT = 37;
+
+    // 建物の色分け（bldg:measuredHeight = 計測高さ）
+    const HEIGHT_THRESHOLD = 9; // 3階建て相当（津波避難ビルの目安）
+    const TALL_COLOR = [0x87 / 255, 0xCE / 255, 0xFA / 255, 1]; // #87CEFA
+    const LOW_COLOR = [0xA9 / 255, 0xA9 / 255, 0xA9 / 255, 1];  // #A9A9A9
+
+    // 6つのピンがちょうど収まる中心
+    const CENTER = [135.50408, 34.70724];
+
+    const PIN_TYPES = {
+      spot: { color: '#90EE90', label: '周辺スポット' },
+      shelter: { color: '#1E6FFF', label: '避難所・津波避難ビル' }
+    };
+
+    const SPOTS = [
+      { type: 'spot', name: '中崎町駅', lngLat: [135.50515, 34.70674],
+        comment: '大阪メトロ谷町線の駅。地下のため水害時は地上への避難が必要。' },
+      { type: 'spot', name: 'Salon de AManTo 天人', lngLat: [135.50436, 34.70805],
+        comment: '築100年以上の古民家カフェ。建物が低いため垂直避難には不向き。' },
+      { type: 'spot', name: 'yatt中崎町', lngLat: [135.50350, 34.70750],
+        comment: '古民家カフェ。建物の色分けから、周辺は低層の建物が密集しているエリアだとわかる。' },
+      { type: 'shelter', name: '中崎町ホール (済美中崎町コミュニティーホール)', lngLat: [135.50477, 34.70765],
+        comment: 'SotMメイン会場。大阪市北区の「指定避難所（140人収容）」に指定されている。' },
+      { type: 'shelter', name: '津波避難ビル：ヴェルデミキ', lngLat: [135.50301, 34.70642],
+        comment: '大阪市指定の津波避難ビル。3階以上の共用廊下が緊急の避難場所となる。' },
+      { type: 'shelter', name: '津波避難ビル：シティハイツサルキ', lngLat: [135.50325, 34.70660],
+        comment: 'こちらも大阪市指定の津波避難ビル（約84人収容）。3階以上の共用廊下に避難可能。' }
+    ];
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          gsi_pale: {
+            type: 'raster',
+            tiles: ['https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            maxzoom: 18,
+            attribution:
+              '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">地理院タイル</a>'
+          }
+        },
+        layers: [{ id: 'gsi_pale', type: 'raster', source: 'gsi_pale' }]
+      },
+      center: CENTER,
+      zoom: 17.4,
+      pitch: 50,
+      bearing: 200, // 北側から南（梅田方面）を望む向き。手前の高層ビルでピンが隠れないようにする
+      maxPitch: 85,
+      attributionControl: false
+    });
+
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+    map.addControl(new maplibregl.AttributionControl({
+      compact: false,
+      customAttribution: [
+        '<a href="https://www.mlit.go.jp/plateau/" target="_blank">国土交通省 PLATEAU</a>',
+        '出典: <a href="https://www.city.osaka.lg.jp/kikikanrishitsu/page/0000138173.html" target="_blank">大阪市 津波避難ビルの一覧</a>' +
+          ' / <a href="https://www.osaka-bousai.net/" target="_blank">おおさか防災ネット 避難所情報</a>'
+      ]
+    }));
+
+    const status = document.getElementById('status');
+
+    // バッチテーブルから建物ごとの計測高さを取り出す（JSON配列 or バイナリ部の DOUBLE 配列）
+    function getMeasuredHeights(content) {
+      const entry = content.batchTableJson && content.batchTableJson['bldg:measuredHeight'];
+      if (Array.isArray(entry)) return entry;
+      const binary = content.batchTableBinary;
+      const batchLength = content.featureTableJson && content.featureTableJson.BATCH_LENGTH;
+      if (entry && entry.componentType === 'DOUBLE' && binary && batchLength) {
+        const start = binary.byteOffset + entry.byteOffset;
+        return new Float64Array(binary.buffer.slice(start, start + batchLength * 8));
+      }
+      return null;
+    }
+
+    // 頂点ごとの建物ID（_BATCHID）。Draco 圧縮のタイルでは "CUSTOM_ATTRIBUTE_n" に名前が変わるため、
+    // 標準属性以外で「1頂点に1つの値」を持つ属性を _BATCHID とみなす
+    function getBatchIds(content, primitive) {
+      const attributes = primitive.attributes;
+      if (attributes._BATCHID) return attributes._BATCHID.value;
+      const vertexCount = attributes.POSITION && attributes.POSITION.value.length / 3;
+      for (const [name, attr] of Object.entries(attributes)) {
+        if (/^(POSITION|NORMAL|TANGENT|TEXCOORD_|COLOR_|JOINTS_|WEIGHTS_)/.test(name)) continue;
+        if (attr && attr.value && attr.value.length === vertexCount) return attr.value;
+      }
+      return null;
+    }
+
+    // タイル内の建物を高さで「高い / 低い」の2つのプリミティブに分け、それぞれに色（マテリアル）を割り当てる。
+    // b3dm の各頂点は _BATCHID で建物（バッチテーブルの行）と対応している。
+    function colorBuildingsByHeight(content) {
+      const heights = getMeasuredHeights(content);
+      const gltf = content.gltf;
+      if (!heights || !gltf || !gltf.meshes) return;
+
+      for (const mesh of gltf.meshes) {
+        const primitives = [];
+        for (const primitive of mesh.primitives) {
+          const batchIds = getBatchIds(content, primitive);
+          const indices = primitive.indices && primitive.indices.value;
+          if (!batchIds || !indices) {
+            primitives.push(primitive);
+            continue;
+          }
+
+          const tall = [];
+          const low = [];
+          for (let i = 0; i < indices.length; i += 3) {
+            const height = heights[batchIds[indices[i]]];
+            (height >= HEIGHT_THRESHOLD ? tall : low).push(indices[i], indices[i + 1], indices[i + 2]);
+          }
+
+          for (const [list, color] of [[tall, TALL_COLOR], [low, LOW_COLOR]]) {
+            if (list.length === 0) continue;
+            const material = primitive.material || {};
+            primitives.push({
+              ...primitive,
+              indices: { ...primitive.indices, value: new Uint32Array(list), count: list.length,
+                         componentType: 5125, byteOffset: 0, bufferView: {} },
+              material: { ...material,
+                          // ライティングで暗く沈みすぎないよう、同じ色を少し自己発光させる
+                          emissiveFactor: color.slice(0, 3).map((c) => c * 0.4),
+                          pbrMetallicRoughness: { ...material.pbrMetallicRoughness, baseColorFactor: color } }
+            });
+          }
+        }
+        mesh.primitives = primitives;
+      }
+    }
+
+    const plateauLayer = new deck.Tile3DLayer({
+      id: 'plateau-osaka-kita',
+      data: PLATEAU_TILESET_URL,
+      onTilesetLoad: () => { status.textContent = '表示中: 大阪市北区 建築物 LOD2'; },
+      onTileLoad: (tile) => {
+        if (!tile.content) return;
+        // タイルごとの原点の高さをジオイド高ぶん下げる
+        const origin = tile.content.cartographicOrigin;
+        if (origin) origin[2] -= GEOID_HEIGHT;
+        colorBuildingsByHeight(tile.content);
+      },
+      onTileError: (tile, url, message) => console.error('Tile error:', url, message)
+    });
+
+    const overlay = new deck.MapboxOverlay({
+      interleaved: true,
+      layers: [plateauLayer],
+      onError: (err) => { status.textContent = 'エラー: ' + err.message; console.error(err); }
+    });
+
+    map.addControl(overlay);
+
+    // ピンとポップアップ
+    for (const spot of SPOTS) {
+      const pinType = PIN_TYPES[spot.type];
+
+      const content = document.createElement('div');
+      content.className = 'spot-popup';
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.style.background = pinType.color;
+      if (spot.type === 'spot') tag.style.color = '#225522';
+      tag.textContent = pinType.label;
+      const title = document.createElement('h3');
+      title.style.borderColor = pinType.color;
+      title.textContent = spot.name;
+      const comment = document.createElement('p');
+      comment.textContent = spot.comment;
+      content.append(tag, title, comment);
+
+      new maplibregl.Marker({ color: pinType.color })
+        .setLngLat(spot.lngLat)
+        .setPopup(new maplibregl.Popup({ offset: 30, maxWidth: '280px' }).setDOMContent(content))
+        .addTo(map);
+    }
+  </script>
+</body>
+</html>
